@@ -9,6 +9,37 @@ from app.models.conversation import EtatConversation
 
 settings = get_settings()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Constantes US 2.2 — Salutations et commandes d'aide
+# Centralisées ici pour faciliter les modifications futures
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Mots déclenchant une réponse de salutation (sans appel Azure)
+_SALUTATIONS = {"bonjour", "bonsoir", "salut", "hello", "hi", "hey", "coucou"}
+
+# Mots déclenchant le menu d'aide (sans appel Azure)
+_COMMANDES_AIDE = {"aide", "help", "?", "menu", "options"}
+
+# Message de salutation
+_MSG_SALUTATION = (
+    "Bonjour ! 👋 Je suis l'assistant virtuel de Smartovate.\n\n"
+    "Comment puis-je vous aider aujourd'hui ?\n"
+    "Tapez **Aide** pour voir les options disponibles."
+)
+
+# Menu d'aide complet
+_MSG_AIDE = (
+    "Voici les sujets sur lesquels je peux vous aider :\n\n"
+    "☁️  **Services Cloud** — catalogue et tarification\n"
+    "🖥️  **Machines virtuelles Azure** — création et configuration\n"
+    "🌐  **Réseau & infrastructure** — VNet, sous-réseaux, sécurité\n"
+    "💾  **Stockage Azure** — Blob, File, configuration\n"
+    "🔐  **Azure Active Directory** — gestion des identités\n"
+    "💳  **Facturation & remboursements** — politique et procédures\n"
+    "🚀  **Guide de démarrage rapide** — premiers pas avec Smartovate\n\n"
+    "Posez-moi votre question directement ou choisissez un sujet ci-dessus."
+)
+
 
 class BotEngine:
     """
@@ -17,106 +48,120 @@ class BotEngine:
     Le BotEngine est le seul composant qui pilote le pipeline de traitement.
     Aucune route ne contourne le BotEngine pour accéder directement aux services Azure.
 
-    Pipeline de traitement d'un message (défini dans la conception UML) :
+    Pipeline complet (US 2.1 + US 2.2) :
     ┌─────────────────────────────────────────────────────────┐
     │  1. Réception du message utilisateur                    │
-    │  2. Changement d'état → EnTraitement                   │
-    │  3. AzureAISearchService.search() → documents          │
-    │  4. AzureOpenAIService.generate_response() → réponse   │
-    │  5. Évaluation du score de confiance                   │
-    │     - Score < seuil → créer HandoffRequest             │
-    │     - Score >= seuil → retourner réponse au Client     │
-    │  6. Changement d'état → EnAttenteMessage ou EnAttenteAgent
+    │  2. Détection rapide (US 2.2)                          │
+    │     - Salutation → réponse directe (pas d'appel Azure) │
+    │     - Commande Aide → menu d'aide (pas d'appel Azure)  │
+    │  3. Question normale → pipeline RAG (US 2.1)           │
+    │     - AzureAISearchService.search() → documents        │
+    │     - AzureOpenAIService.generate_response()           │
+    │       → prompt expert cloud + RAG + historique         │
+    │       → réponse gpt-4o (temperature=0.1)               │
+    │  4. Évaluation du score de confiance (Sprint 3)        │
     └─────────────────────────────────────────────────────────┘
-
-    Gestion du Handoff :
-    - Déclenché si l'utilisateur le demande explicitement
-    - Déclenché si le score de confiance est inférieur à APP_CONFIDENCE_THRESHOLD
     """
 
     def __init__(self):
-        # AzureOpenAIService : opérationnel depuis l'étape 2
         self.openai_service = AzureOpenAIService()
-
-        # AzureAISearchService : squelette — sera activé à l'étape RAG
         self.search_service = AzureAISearchService()
-
-        # Seuil de confiance pour déclencher le handoff (configurable via .env)
         self.confidence_threshold = settings.app_confidence_threshold
+
+    def get_welcome_message(self) -> str:
+        """
+        Retourne le message de bienvenue Smartovate.
+        Appelé par SmartovateBot.on_members_added_activity() (US 2.2).
+        """
+        return (
+            "Bonjour et bienvenue chez Smartovate ! 👋\n\n"
+            "Je suis votre assistant virtuel spécialisé dans les services Cloud Microsoft Azure.\n\n"
+            "Je peux vous aider avec :\n"
+            "• ☁️  Les configurations Cloud et services Azure\n"
+            "• 🖥️  Les machines virtuelles (VM)\n"
+            "• 🌐  Le réseau et l'infrastructure\n"
+            "• 💳  La facturation et les remboursements\n\n"
+            "Tapez **Aide** pour voir toutes les options disponibles,\n"
+            "ou posez-moi directement votre question."
+        )
 
     def process_message(self, message: str, conversation_id: str, history: list) -> dict:
         """
         Traite un message entrant.
 
-        Pipeline actuel (étape Bot Framework — sans RAG) :
-          1. Réception du message
-          2. Appel direct à AzureOpenAIService (gpt-4o)
-          3. Retour de la réponse
-
-        Pipeline futur (après étape RAG) :
-          1. Réception du message
-          2. AzureAISearchService.search() → documents pertinents
-          3. AzureOpenAIService.generate_response(message + documents)
-          4. Évaluation du score de confiance → handoff si nécessaire
-          5. Retour de la réponse
+        Priorité de traitement (US 2.2 en premier, US 2.1 si question normale) :
+          1. Salutation → réponse directe, pas d'appel Azure
+          2. Commande Aide/Help → menu d'aide, pas d'appel Azure
+          3. Question normale → pipeline RAG complet (US 2.1)
 
         Args:
             message         : texte du message utilisateur
             conversation_id : ID de la conversation en cours
-            history         : historique des messages de la conversation
+            history         : historique des messages [{"role": ..., "content": ...}]
 
         Returns:
             dict avec :
-            - 'reponse'         : texte de la réponse générée
-            - 'etat'            : état de la conversation (EnAttenteMessage pour l'instant)
-            - 'handoff'         : False (sera évalué à l'étape handoff)
-            - 'sources'         : [] (sera rempli à l'étape RAG)
+            - 'reponse'   : texte de la réponse
+            - 'etat'      : état de la conversation
+            - 'handoff'   : False (Sprint 3)
+            - 'sources'   : documents RAG utilisés (vide pour salutations/aide)
+            - 'tokens'    : tokens consommés (vide pour salutations/aide)
+            - 'type'      : 'salutation' | 'aide' | 'rag' — utile pour les logs
         """
-        # Appel à Azure OpenAI via AzureOpenAIService — sans documents RAG pour l'instant
+        message_normalise = message.strip().lower().rstrip("!?.")
+
+        # ── Cas 2 : Salutation ───────────────────────────────────────────
+        # Détection par mot-clé exact — évite un appel inutile à Azure
+        if message_normalise in _SALUTATIONS:
+            return {
+                "reponse": _MSG_SALUTATION,
+                "etat": EtatConversation.EN_ATTENTE_MESSAGE,
+                "handoff": False,
+                "sources": [],
+                "tokens": {},
+                "type": "salutation",
+            }
+
+        # ── Cas 3 : Commande Aide / Help ─────────────────────────────────
+        # Détection par mot-clé exact — affiche le menu sans appel Azure
+        if message_normalise in _COMMANDES_AIDE:
+            return {
+                "reponse": _MSG_AIDE,
+                "etat": EtatConversation.EN_ATTENTE_MESSAGE,
+                "handoff": False,
+                "sources": [],
+                "tokens": {},
+                "type": "aide",
+            }
+
+        # ── Cas 4 : Question normale — pipeline RAG complet (US 2.1) ────
+        context_documents = self.search_service.search(query=message, top_k=3)
+
         result = self.openai_service.generate_response(
             user_message=message,
             history=history,
-            context_documents=[],  # Sera rempli par AzureAISearchService à l'étape RAG
+            context_documents=context_documents,
         )
 
         return {
             "reponse": result["reponse"],
             "etat": EtatConversation.EN_ATTENTE_MESSAGE,
-            "handoff": False,       # Sera évalué à l'étape handoff
-            "sources": [],          # Sera rempli à l'étape RAG
+            "handoff": False,
+            "sources": context_documents,
             "tokens": result.get("tokens", {}),
+            "type": "rag",
         }
 
     def request_handoff(self, conversation_id: str, utilisateur_id: str, raison: str) -> dict:
         """
-        Crée une demande de HandoffRequest et change l'état de la conversation.
-
-        Déclenché par :
-        - Demande explicite du client
-        - Score de confiance trop faible (appelé automatiquement par process_message)
-
-        Args:
-            conversation_id : ID de la conversation à transférer
-            utilisateur_id  : ID du client demandant le transfert
-            raison          : 'demande_client' ou 'confiance_faible'
-
-        Returns:
-            dict avec l'ID du HandoffRequest créé et le nouvel état
-
-        Note: La logique complète sera implémentée lors de l'étape de handoff.
+        Crée une demande de HandoffRequest.
+        TODO : implémenter au Sprint 3.
         """
-        # TODO : implémenter lors de l'étape de gestion du handoff
-        raise NotImplementedError("BotEngine.request_handoff sera implémenté à l'étape handoff")
+        raise NotImplementedError("BotEngine.request_handoff sera implémenté au Sprint 3")
 
     def _should_trigger_handoff(self, score_confiance: float) -> bool:
         """
-        Vérifie si le score de confiance est inférieur au seuil configuré.
-        Méthode interne utilisée par process_message.
-
-        Args:
-            score_confiance : score retourné par AzureOpenAIService (0.0 à 1.0)
-
-        Returns:
-            True si un handoff doit être déclenché
+        Vérifie si le score de confiance déclenche un handoff.
+        Sera utilisé dans process_message() au Sprint 3.
         """
         return score_confiance < self.confidence_threshold

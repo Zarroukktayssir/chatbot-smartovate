@@ -4,13 +4,8 @@
 # Rôle : recevoir les Activity (messages) envoyées par Azure Bot Service,
 #        déléguer le traitement au BotEngine, et retourner la réponse.
 #
-# Position dans l'architecture :
-#   Azure Bot Service
-#       → POST /api/messages
-#       → SmartovateBot.on_message_activity()
-#       → BotEngine.process_message()
-#       → AzureOpenAIService
-#       → réponse au canal (Web Chat, Teams, etc.)
+# US 2.2 : message de bienvenue proactif via on_members_added_activity()
+# US 2.1 : pipeline RAG via on_message_activity() → BotEngine.process_message()
 
 from botbuilder.core import ActivityHandler, TurnContext, MessageFactory
 from botbuilder.schema import ChannelAccount
@@ -22,32 +17,23 @@ class SmartovateBot(ActivityHandler):
     """
     Bot principal Smartovate — hérite de ActivityHandler (Bot Framework SDK).
 
-    ActivityHandler est la classe de base fournie par le Bot Framework.
-    Elle gère automatiquement le routing des différents types d'Activity :
-    - on_message_activity     : quand un utilisateur envoie un message
-    - on_members_added_activity : quand un utilisateur rejoint la conversation
-
-    Le BotEngine est instancié une seule fois pour toute la durée de vie du bot.
+    Gestion des Activity :
+    - on_message_activity       : message utilisateur → BotEngine → réponse
+    - on_members_added_activity : nouveau membre → message de bienvenue (US 2.2)
     """
 
     def __init__(self):
         super().__init__()
-        # BotEngine est l'orchestrateur — le bot ne parle jamais directement à Azure OpenAI
         self.bot_engine = BotEngine()
 
     async def on_message_activity(self, turn_context: TurnContext):
         """
-        Appelé par le Bot Framework chaque fois qu'un utilisateur envoie un message.
+        Appelé à chaque message utilisateur.
 
-        TurnContext contient :
-        - turn_context.activity.text : le texte du message utilisateur
-        - turn_context.activity.conversation.id : l'ID de la conversation
-        - turn_context.activity.from_property.id : l'ID de l'utilisateur
-
-        Flow complet :
-        1. Extraire le message texte
-        2. Passer au BotEngine pour traitement (OpenAI, plus tard RAG + handoff)
-        3. Retourner la réponse via turn_context.send_activity()
+        Délègue entièrement au BotEngine qui gère :
+        - Les salutations (US 2.2) → réponse directe
+        - La commande Aide/Help (US 2.2) → menu d'aide
+        - Les questions normales (US 2.1) → pipeline RAG complet
         """
         user_message = turn_context.activity.text
         conversation_id = turn_context.activity.conversation.id
@@ -59,20 +45,16 @@ class SmartovateBot(ActivityHandler):
             return
 
         try:
-            # Délégation au BotEngine — seul responsable du pipeline de traitement
             result = self.bot_engine.process_message(
                 message=user_message.strip(),
                 conversation_id=conversation_id,
-                history=[],  # L'historique sera géré à l'étape de persistance
+                history=[],  # Historique géré à la persistance (Sprint ultérieur)
             )
-
-            # Envoi de la réponse au canal via le Bot Framework
             await turn_context.send_activity(
                 MessageFactory.text(result["reponse"])
             )
 
         except Exception:
-            # Message d'erreur générique — aucune information sensible exposée
             await turn_context.send_activity(
                 MessageFactory.text(
                     "Désolé, une erreur est survenue. Veuillez réessayer dans quelques instants."
@@ -83,15 +65,14 @@ class SmartovateBot(ActivityHandler):
         self, members_added: list[ChannelAccount], turn_context: TurnContext
     ):
         """
-        Appelé quand un nouvel utilisateur rejoint la conversation.
-        Envoie un message de bienvenue.
+        Appelé quand un nouvel utilisateur rejoint la conversation (US 2.2).
+
+        Envoie le message de bienvenue Smartovate — le contenu est centralisé
+        dans BotEngine.get_welcome_message() pour rester cohérent avec la logique métier.
         """
         for member in members_added:
             # Ne pas envoyer le message de bienvenue au bot lui-même
             if member.id != turn_context.activity.recipient.id:
                 await turn_context.send_activity(
-                    MessageFactory.text(
-                        "Bonjour ! Je suis l'assistant Smartovate. "
-                        "Comment puis-je vous aider aujourd'hui ?"
-                    )
+                    MessageFactory.text(self.bot_engine.get_welcome_message())
                 )

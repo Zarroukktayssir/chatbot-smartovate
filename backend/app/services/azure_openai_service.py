@@ -14,27 +14,28 @@ class AzureOpenAIService:
 
     Responsabilités :
     - Initialiser le client AzureOpenAI via le SDK officiel openai (v1.x)
-    - Générer une réponse à partir d'un message utilisateur et d'un historique
-    - Retourner la réponse textuelle
+    - Construire le prompt avec les documents RAG + historique + message
+    - Générer une réponse contextualisée et anti-hallucination
 
     Configuration lue depuis .env (jamais hardcodée) :
     - AZURE_OPENAI_ENDPOINT
     - AZURE_OPENAI_API_KEY
     - AZURE_OPENAI_API_VERSION
-    - AZURE_OPENAI_DEPLOYMENT  (ex: gpt-4o)
-    - AZURE_OPENAI_TEMPERATURE (0.1 selon la conception UML)
+    - AZURE_OPENAI_DEPLOYMENT  (gpt-4o)
+    - AZURE_OPENAI_TEMPERATURE (0.1 — valeur très basse pour réduire les hallucinations)
     """
 
+    # Nombre maximum de documents RAG injectés dans le prompt
+    MAX_CONTEXT_DOCS = 3
+
     def __init__(self):
-        # Initialisation du client Azure OpenAI avec les paramètres depuis .env
-        # La clé API est passée directement au client — elle n'est jamais loguée
         self.client = AzureOpenAI(
             azure_endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
             api_version=settings.azure_openai_api_version,
         )
-        self.deployment = settings.azure_openai_deployment      # ex: "gpt-4o"
-        self.temperature = settings.azure_openai_temperature    # 0.1 selon conception UML
+        self.deployment = settings.azure_openai_deployment      # gpt-4o
+        self.temperature = settings.azure_openai_temperature    # 0.1
 
     def generate_response(
         self,
@@ -48,33 +49,30 @@ class AzureOpenAIService:
         Args:
             user_message      : message de l'utilisateur
             history           : liste de dicts {"role": ..., "content": ...}
-                                représentant l'historique de la conversation
-            context_documents : documents RAG fournis par AzureAISearchService
-                                (sera utilisé à l'étape RAG — ignoré pour l'instant)
+            context_documents : chunks RAG fournis par AzureAISearchService
+                                [{"contenu": ..., "source": ..., "score": ...}, ...]
 
         Returns:
             dict avec :
             - "reponse"  : texte de la réponse générée par gpt-4o
             - "modele"   : nom du deployment utilisé
-            - "tokens"   : nombre de tokens consommés (utile pour les métriques)
+            - "tokens"   : tokens consommés (prompt, completion, total)
         """
         if history is None:
             history = []
+        if context_documents is None:
+            context_documents = []
 
-        # Construction des messages à envoyer à Azure OpenAI
         messages = self._build_messages(user_message, history, context_documents)
 
-        # Appel à Azure OpenAI — la clé API est dans le client, jamais dans la requête
         response = self.client.chat.completions.create(
-            model=self.deployment,          # Nom du deployment depuis .env
+            model=self.deployment,
             messages=messages,
-            temperature=self.temperature,   # 0.1 depuis .env
+            temperature=self.temperature,   # 0.1 — réduit les hallucinations
         )
 
-        reponse_texte = response.choices[0].message.content
-
         return {
-            "reponse": reponse_texte,
+            "reponse": response.choices[0].message.content,
             "modele": self.deployment,
             "tokens": {
                 "prompt": response.usage.prompt_tokens,
@@ -87,39 +85,70 @@ class AzureOpenAIService:
         self,
         user_message: str,
         history: list,
-        context_documents: list = None,
+        context_documents: list,
     ) -> list:
         """
         Construit la liste de messages pour l'API Azure OpenAI.
 
-        Structure :
-        1. Message système (system prompt Smartovate)
-        2. Historique de la conversation
+        Structure du prompt :
+        1. System message — persona expert cloud + documents RAG + directive anti-hallucination
+        2. Historique de la conversation (maintien du contexte)
         3. Message utilisateur courant
 
-        Note : l'injection des documents RAG sera ajoutée à l'étape Azure AI Search.
+        Les documents RAG sont injectés dans le system message pour forcer gpt-4o
+        à répondre uniquement à partir des informations de la base de connaissances.
         """
-        # Message système — définit le comportement du chatbot
-        system_message = {
-            "role": "system",
-            "content": (
-                "Tu es un assistant conversationnel intelligent pour Smartovate. "
-                "Tu réponds aux questions des utilisateurs de manière claire, précise et professionnelle. "
-                "Si tu ne connais pas la réponse, dis-le honnêtement plutôt que d'inventer."
-            ),
-        }
 
-        messages = [system_message]
+        # ── Construction du bloc de contexte documentaire ───────────────
+        if context_documents:
+            docs_text = "\n\n".join([
+                f"[Source: {doc.get('source', 'N/A')} | Page: {doc.get('page', '?')}]\n"
+                f"{doc.get('contenu', '')}"
+                for doc in context_documents[:self.MAX_CONTEXT_DOCS]
+            ])
+            contexte_section = (
+                "\n\n---\n"
+                "DOCUMENTS DE RÉFÉRENCE (base de connaissances Smartovate) :\n\n"
+                f"{docs_text}"
+                "\n---"
+            )
+        else:
+            contexte_section = ""
 
-        # Ajout de l'historique de la conversation (pour maintenir le contexte)
+        # ── System prompt professionnel Smartovate ───────────────────────
+        # Directive stricte : répondre uniquement depuis les documents fournis.
+        # Si l'information n'est pas disponible, ne pas inventer.
+        # Temperature=0.1 renforce cette directive côté modèle.
+        system_content = (
+            "Tu es l'assistant virtuel officiel de Smartovate, entreprise experte en conseil "
+            "et solutions cloud Microsoft Azure.\n\n"
+            "Ton rôle est d'aider les clients et collaborateurs de Smartovate avec :\n"
+            "- La configuration et l'utilisation des services Azure (VM, réseau, stockage, Azure AD)\n"
+            "- Les questions de facturation et de politique de remboursement\n"
+            "- La prise en main rapide des outils et services Smartovate\n\n"
+            "RÈGLES STRICTES :\n"
+            "1. Tu réponds UNIQUEMENT à partir des documents de référence fournis ci-dessous.\n"
+            "2. Si la réponse ne se trouve pas dans ces documents, réponds exactement : "
+            "\"Je ne dispose pas de cette information dans ma base de connaissances. "
+            "Souhaitez-vous être mis en relation avec un conseiller Smartovate ?\"\n"
+            "3. Tu ne dois jamais inventer de prix, de caractéristiques ou de procédures "
+            "qui ne figurent pas dans les documents.\n"
+            "4. Tu répondras toujours en français, de manière claire, concise et professionnelle.\n"
+            "5. Si la question est ambiguë, demande une clarification avant de répondre."
+            f"{contexte_section}"
+        )
+
+        messages = [{"role": "system", "content": system_content}]
+
+        # ── Ajout de l'historique de la conversation ─────────────────────
         for msg in history:
             if msg.get("role") in ("user", "assistant", "agent"):
                 messages.append({
-                    "role": msg["role"] if msg["role"] != "agent" else "assistant",
+                    "role": "assistant" if msg["role"] == "agent" else msg["role"],
                     "content": msg["content"],
                 })
 
-        # Message courant de l'utilisateur
+        # ── Message courant de l'utilisateur ────────────────────────────
         messages.append({"role": "user", "content": user_message})
 
         return messages

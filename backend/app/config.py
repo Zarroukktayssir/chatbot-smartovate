@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     azure_openai_endpoint: str = ""
     azure_openai_api_key: str = ""
     azure_openai_api_version: str = "2024-02-01"
-    azure_openai_deployment: str = "gpt-4o"      # Nom du deployment (configurable)
+    azure_openai_deployment: str = "gpt-4o"                          # Deployment chat
+    azure_openai_embedding_deployment: str = "text-embedding-3-large"  # Deployment embedding (RAG)
     azure_openai_temperature: float = 0.1        # Température prévue dans la conception UML
 
     # --- Azure AI Search ---
