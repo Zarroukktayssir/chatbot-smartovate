@@ -1,0 +1,5 @@
+# Traiter les fichiers binaires sans conversion de fins de ligne
+*.pdf binary
+*.docx binary
+*.dll binary
+*.exe binary
