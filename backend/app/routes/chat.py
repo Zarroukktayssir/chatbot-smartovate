@@ -47,6 +47,7 @@ class ChatMessageRequest(BaseModel):
     conversation_id: str
     message: str
     history: Optional[List[MessageItem]] = []
+    utilisateur_id: Optional[str] = "anonymous"  # US 3.1 — identifiant client pour HandoffRequest
 
 
 class ChatMessageResponse(BaseModel):
@@ -55,10 +56,11 @@ class ChatMessageResponse(BaseModel):
     reponse: str
     sources: list
     tokens: dict
-    type: str               # "rag" | "salutation" | "aide"
+    type: str                        # "rag" | "salutation" | "aide" | "handoff_demande"
     etat: str
-    handoff: bool = False   # True si score RAG < seuil de confiance (handoff Sprint 3)
-    score_confiance: Optional[float] = None  # Meilleur score RAG (absent pour salutations/aide)
+    handoff: bool = False            # True si handoff déclenché (score faible ou demande client)
+    score_confiance: Optional[float] = None   # Score RAG (absent pour salutations/aide/handoff)
+    handoff_id: Optional[str] = None          # ID de la HandoffRequest (présent si handoff=True)
 
 
 # ─────────────────────────────────────────────────────────
@@ -143,6 +145,7 @@ def envoyer_message(request: ChatMessageRequest):
             message=request.message,
             conversation_id=request.conversation_id,
             history=history,
+            utilisateur_id=request.utilisateur_id,
         )
 
         return ChatMessageResponse(
@@ -154,6 +157,7 @@ def envoyer_message(request: ChatMessageRequest):
             etat=result["etat"],
             handoff=result.get("handoff", False),
             score_confiance=result.get("score_confiance"),
+            handoff_id=result.get("handoff_id"),
         )
 
     except Exception as e:
@@ -165,16 +169,116 @@ def envoyer_message(request: ChatMessageRequest):
 
 
 # ─────────────────────────────────────────────────────────
+# Schéma US 2.2 — Réponse du message de bienvenue
+# ─────────────────────────────────────────────────────────
+
+class WelcomeResponse(BaseModel):
+    """Réponse retournée par GET /api/chat/start."""
+    message: str    # Texte du message de bienvenue (BotEngine.get_welcome_message())
+    type: str       # Toujours "welcome"
+
+
+# ─────────────────────────────────────────────────────────
+# Route US 2.2 — Démarrage de conversation
+# GET /api/chat/start — message de bienvenue proactif
+# ─────────────────────────────────────────────────────────
+
+@router.get(
+    "/start",
+    response_model=WelcomeResponse,
+    summary="Démarrer une conversation — message de bienvenue",
+    description=(
+        "Retourne le message de bienvenue Smartovate à afficher à l'ouverture du chat. "
+        "Aucun appel à Azure OpenAI ni à Azure AI Search n'est effectué. "
+        "Le contenu est fourni par BotEngine.get_welcome_message()."
+    ),
+)
+def demarrer_conversation():
+    """
+    Retourne le message de bienvenue proactif (US 2.2).
+
+    Appelé par le frontend à l'ouverture de la fenêtre de chat,
+    avant tout message utilisateur. Ne consomme aucun token Azure.
+    """
+    engine = BotEngine()
+    return WelcomeResponse(
+        message=engine.get_welcome_message(),
+        type="welcome",
+    )
+
+
+# ─────────────────────────────────────────────────────────
 # Routes Client — à implémenter aux étapes suivantes
 # ─────────────────────────────────────────────────────────
 
-@router.post("/handoff")
-def demander_handoff():
+# ─────────────────────────────────────────────────────────
+# Schéma US 3.1 — Requête handoff explicite
+# ─────────────────────────────────────────────────────────
+
+class HandoffRequest(BaseModel):
+    """Corps de la requête POST /api/chat/handoff."""
+    conversation_id: str
+    utilisateur_id: Optional[str] = "anonymous"
+    raison: Optional[str] = "Le client souhaite parler à un agent humain."
+
+
+class HandoffResponse(BaseModel):
+    """Réponse retournée par POST /api/chat/handoff."""
+    conversation_id: str
+    handoff_id: str
+    message: str        # Message d'attente à afficher au client
+    etat: str           # "EnAttenteAgent"
+    handoff: bool       # Toujours True
+
+
+# ─────────────────────────────────────────────────────────
+# Route US 3.1 — Handoff explicite demandé par le client
+# POST /api/chat/handoff
+# ─────────────────────────────────────────────────────────
+
+@router.post(
+    "/handoff",
+    response_model=HandoffResponse,
+    summary="Demander un transfert vers un agent humain",
+    description=(
+        "Le client demande explicitement à être mis en relation avec un agent humain. "
+        "Crée une HandoffRequest dans la file d'attente et retourne un message d'attente. "
+        "Aucun appel Azure OpenAI ni Azure AI Search n'est effectué."
+    ),
+)
+def demander_handoff(request: HandoffRequest):
     """
-    Le Client demande explicitement à être transféré vers un Agent humain.
-    TODO : implémenter lors de l'étape de gestion du handoff.
+    Crée une HandoffRequest via BotEngine.request_handoff() (US 3.1).
+
+    Le frontend peut appeler cet endpoint directement (bouton "Parler à un agent")
+    ou il est déclenché automatiquement via process_message() quand l'intention
+    est détectée dans le message.
     """
-    return {"detail": "Route POST /api/chat/handoff — à implémenter"}
+    from app.models.handoff_request import RaisonHandoff
+
+    try:
+        engine = BotEngine()
+        handoff = engine.request_handoff(
+            conversation_id=request.conversation_id,
+            utilisateur_id=request.utilisateur_id,
+            raison=RaisonHandoff.DEMANDE_CLIENT,
+        )
+        return HandoffResponse(
+            conversation_id=request.conversation_id,
+            handoff_id=handoff["id"],
+            message=(
+                "Votre demande de mise en relation a bien été enregistrée. 🙏\n\n"
+                "Un conseiller Smartovate va prendre en charge votre conversation "
+                "dans les plus brefs délais."
+            ),
+            etat="EnAttenteAgent",
+            handoff=True,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la création de la demande de handoff. ({type(e).__name__})",
+        )
 
 
 @router.get("/conversation/{conversation_id}")
