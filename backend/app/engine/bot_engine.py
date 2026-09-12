@@ -56,10 +56,12 @@ class BotEngine:
     │     - Commande Aide → menu d'aide (pas d'appel Azure)  │
     │  3. Question normale → pipeline RAG (US 2.1)           │
     │     - AzureAISearchService.search() → documents        │
+    │     - Évaluation score RAG vs seuil 0.7 (US 2.1 c.7)  │
+    │       → score < 0.7 : handoff=True, pas d'appel OpenAI │
     │     - AzureOpenAIService.generate_response()           │
     │       → prompt expert cloud + RAG + historique         │
     │       → réponse gpt-4o (temperature=0.1)               │
-    │  4. Évaluation du score de confiance (Sprint 3)        │
+    │  4. Handoff complet vers agent humain (Sprint 3)       │
     └─────────────────────────────────────────────────────────┘
     """
 
@@ -101,12 +103,13 @@ class BotEngine:
 
         Returns:
             dict avec :
-            - 'reponse'   : texte de la réponse
-            - 'etat'      : état de la conversation
-            - 'handoff'   : False (Sprint 3)
-            - 'sources'   : documents RAG utilisés (vide pour salutations/aide)
-            - 'tokens'    : tokens consommés (vide pour salutations/aide)
-            - 'type'      : 'salutation' | 'aide' | 'rag' — utile pour les logs
+            - 'reponse'        : texte de la réponse
+            - 'etat'           : état de la conversation
+            - 'handoff'        : True si score RAG < seuil (0.7), False sinon
+            - 'sources'        : documents RAG utilisés (vide pour salutations/aide)
+            - 'tokens'         : tokens consommés (vide si handoff ou salutation/aide)
+            - 'type'           : 'salutation' | 'aide' | 'rag'
+            - 'score_confiance': meilleur score RAG (absent pour salutations/aide)
         """
         message_normalise = message.strip().lower().rstrip("!?.")
 
@@ -137,6 +140,29 @@ class BotEngine:
         # ── Cas 4 : Question normale — pipeline RAG complet (US 2.1) ────
         context_documents = self.search_service.search(query=message, top_k=3)
 
+        # ── Évaluation du seuil de confiance RAG (US 2.1 critère 7) ─────
+        # Le meilleur score est celui du premier document retourné par Azure AI Search
+        # (les résultats sont triés par score décroissant).
+        # Si aucun document n'est trouvé, le score est 0.0 — en dessous du seuil.
+        meilleur_score = context_documents[0]["score"] if context_documents else 0.0
+
+        if self._should_trigger_handoff(meilleur_score):
+            # Score insuffisant — on ne génère pas de réponse IA potentiellement non fiable.
+            # Le vrai workflow de handoff vers un agent humain sera implémenté au Sprint 3.
+            return {
+                "reponse": (
+                    "Je ne dispose pas d'informations suffisamment pertinentes pour répondre "
+                    "à votre question avec certitude.\n\n"
+                    "Souhaitez-vous être mis en relation avec un conseiller Smartovate ?"
+                ),
+                "etat": EtatConversation.EN_ATTENTE_AGENT,
+                "handoff": True,
+                "sources": context_documents,
+                "tokens": {},
+                "type": "rag",
+                "score_confiance": meilleur_score,
+            }
+
         result = self.openai_service.generate_response(
             user_message=message,
             history=history,
@@ -150,6 +176,7 @@ class BotEngine:
             "sources": context_documents,
             "tokens": result.get("tokens", {}),
             "type": "rag",
+            "score_confiance": meilleur_score,
         }
 
     def request_handoff(self, conversation_id: str, utilisateur_id: str, raison: str) -> dict:
