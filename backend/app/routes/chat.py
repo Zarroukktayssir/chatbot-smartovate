@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 from app.services.azure_openai_service import AzureOpenAIService
+from app.services import conversation_store
 from app.engine.bot_engine import BotEngine
 
 router = APIRouter()
@@ -148,6 +149,33 @@ def envoyer_message(request: ChatMessageRequest):
             utilisateur_id=request.utilisateur_id,
         )
 
+        # ── Persistance en mémoire (conversation store) ──────────────────
+        conversation_store.get_or_create_conversation(
+            conversation_id=request.conversation_id,
+            utilisateur_id=request.utilisateur_id,
+        )
+        conversation_store.add_message(
+            conversation_id=request.conversation_id,
+            role="user",
+            contenu=request.message,
+        )
+        conversation_store.add_message(
+            conversation_id=request.conversation_id,
+            role="assistant",
+            contenu=result["reponse"],
+            score_confiance=result.get("score_confiance"),
+            sources_documents=result.get("sources", []),
+        )
+        from app.models.conversation import EtatConversation as EC
+        try:
+            etat_conv = EC(result["etat"])
+        except ValueError:
+            etat_conv = EC.EN_ATTENTE_MESSAGE
+        conversation_store.update_conversation_state(
+            conversation_id=request.conversation_id,
+            etat=etat_conv,
+        )
+
         return ChatMessageResponse(
             conversation_id=request.conversation_id,
             reponse=result["reponse"],
@@ -281,10 +309,40 @@ def demander_handoff(request: HandoffRequest):
         )
 
 
-@router.get("/conversation/{conversation_id}")
+@router.get(
+    "/conversation/{conversation_id}",
+    summary="Récupérer l'historique d'une conversation",
+    description=(
+        "Retourne l'état actuel et l'historique complet des messages "
+        "d'une conversation. Permet au frontend de restaurer une session."
+    ),
+)
 def get_conversation(conversation_id: str):
     """
-    Récupère l'historique et l'état d'une conversation.
-    TODO : implémenter lors de l'étape de persistance.
+    Retourne l'historique et l'état d'une conversation en mémoire.
+
+    Si la conversation n'existe pas encore (nouveau session_id),
+    retourne un état vide avec etat=EnAttenteMessage.
     """
-    return {"detail": f"Route GET /api/chat/conversation/{conversation_id} — à implémenter"}
+    from app.services import conversation_store
+
+    conv = conversation_store.get_conversation(conversation_id)
+    messages = conversation_store.get_conversation_history(conversation_id)
+
+    if not conv:
+        return {
+            "conversation_id": conversation_id,
+            "etat": "EnAttenteMessage",
+            "messages": [],
+            "count": 0,
+        }
+
+    return {
+        "conversation_id": conversation_id,
+        "etat": conv.etat,
+        "utilisateur_id": conv.utilisateur_id,
+        "date_creation": conv.date_creation.isoformat(),
+        "date_derniere_activite": conv.date_derniere_activite.isoformat(),
+        "messages": messages,
+        "count": len(messages),
+    }

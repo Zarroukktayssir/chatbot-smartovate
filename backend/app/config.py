@@ -35,8 +35,18 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     debug: bool = False
 
-    # Seuil de confiance en dessous duquel un handoff vers un agent humain est déclenché
-    app_confidence_threshold: float = 0.7
+    # Seuil de confiance en dessous duquel un handoff vers un agent humain est déclenché.
+    # Recherche hybride RRF Azure AI Search : les scores sont entre 0.01 et 0.033.
+    # On utilise 0.020 comme seuil — les questions hors sujet tombent typiquement
+    # entre 0.013 et 0.019, les questions pertinentes dépassent 0.020.
+    # Cela évite que OpenAI gère les questions hors sujet et déclenche un faux handoff.
+    app_confidence_threshold: float = 0.020
+
+    # --- Direct Line (Azure Bot Service Web Chat) ---
+    # Clé secrète Direct Line — à remplir depuis le portail Azure Bot Service
+    # (Canaux → Direct Line → Afficher les clés secrètes)
+    # Laisser vide en développement local : le token sera simulé
+    direct_line_secret: str = ""
 
     class Config:
         # Lecture automatique depuis le fichier .env à la racine du backend

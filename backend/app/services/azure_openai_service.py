@@ -117,7 +117,8 @@ class AzureOpenAIService:
 
         # ── System prompt professionnel Smartovate ───────────────────────
         # Directive stricte : répondre uniquement depuis les documents fournis.
-        # Si l'information n'est pas disponible, ne pas inventer.
+        # Si l'information n'est pas disponible, retourner le tag HORS_SUJET
+        # que le BotEngine intercepte pour proposer le handoff proprement.
         # Temperature=0.1 renforce cette directive côté modèle.
         system_content = (
             "Tu es l'assistant virtuel officiel de Smartovate, entreprise experte en conseil "
@@ -128,9 +129,9 @@ class AzureOpenAIService:
             "- La prise en main rapide des outils et services Smartovate\n\n"
             "RÈGLES STRICTES :\n"
             "1. Tu réponds UNIQUEMENT à partir des documents de référence fournis ci-dessous.\n"
-            "2. Si la réponse ne se trouve pas dans ces documents, réponds exactement : "
-            "\"Je ne dispose pas de cette information dans ma base de connaissances. "
-            "Souhaitez-vous être mis en relation avec un conseiller Smartovate ?\"\n"
+            "2. Si la question ne concerne pas Smartovate ou les services Azure, "
+            "ou si la réponse ne se trouve pas dans les documents fournis, "
+            "réponds UNIQUEMENT avec le mot-clé exact (sans rien ajouter) : ##HORS_SUJET##\n"
             "3. Tu ne dois jamais inventer de prix, de caractéristiques ou de procédures "
             "qui ne figurent pas dans les documents.\n"
             "4. Tu répondras toujours en français, de manière claire, concise et professionnelle.\n"

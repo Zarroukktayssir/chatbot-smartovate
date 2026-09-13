@@ -91,3 +91,15 @@ def ajouter_message_agent(conversation_id: str, agent_id: str, contenu: str) -> 
 def get_messages_agent(conversation_id: str) -> list:
     """Retourne tous les messages agent pour une conversation."""
     return _agent_messages.get(conversation_id, [])
+
+
+def resoudre_handoff(conversation_id: str) -> Optional[HandoffRequest]:
+    """
+    Marque la HandoffRequest comme RÉSOLUE (conversation clôturée).
+    Retourne la HandoffRequest mise à jour, ou None si introuvable.
+    """
+    handoff = _handoff_requests.get(conversation_id)
+    if not handoff:
+        return None
+    handoff.statut = StatutHandoff.RESOLUE
+    return handoff

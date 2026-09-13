@@ -151,3 +151,78 @@ def get_messages_agent(conversation_id: str):
         "count": len(messages),
         "messages": messages,
     }
+
+
+# ─────────────────────────────────────────────────────────
+# GET /api/agent/conversation/{conversation_id} — Historique complet
+# ─────────────────────────────────────────────────────────
+
+@router.get(
+    "/conversation/{conversation_id}",
+    summary="Voir l'historique complet d'une conversation",
+    description=(
+        "Retourne l'historique complet (messages client + bot) "
+        "et les messages de l'agent pour une conversation. "
+        "Permet à l'agent de voir le contexte avant de répondre."
+    ),
+)
+def get_conversation_pour_agent(conversation_id: str):
+    """
+    Retourne le contexte complet d'une conversation pour l'agent.
+    Combine l'historique bot/client (conversation_store) et
+    les messages déjà envoyés par l'agent (handoff_store).
+    """
+    from app.services import conversation_store as cs
+
+    handoff = handoff_store.get_handoff(conversation_id)
+    if not handoff:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Aucune HandoffRequest trouvée pour la conversation '{conversation_id}'.",
+        )
+
+    historique = cs.get_conversation_history(conversation_id)
+    messages_agent = handoff_store.get_messages_agent(conversation_id)
+
+    return {
+        "conversation_id": conversation_id,
+        "handoff": handoff.model_dump(),
+        "historique_bot": historique,
+        "messages_agent": messages_agent,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# POST /api/agent/resolve/{conversation_id} — Clôturer
+# ─────────────────────────────────────────────────────────
+
+@router.post(
+    "/resolve/{conversation_id}",
+    summary="Clôturer une conversation après prise en charge",
+    description=(
+        "L'agent marque la conversation comme résolue. "
+        "Le statut de la HandoffRequest passe à RÉSOLUE."
+    ),
+)
+def resoudre_conversation(conversation_id: str):
+    """
+    Clôture la HandoffRequest pour une conversation (US 3.1).
+    À appeler quand l'agent a terminé son intervention.
+    """
+    from app.services import conversation_store as cs
+    from app.models.conversation import EtatConversation
+
+    handoff = handoff_store.resoudre_handoff(conversation_id)
+    if not handoff:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Aucune HandoffRequest trouvée pour la conversation '{conversation_id}'.",
+        )
+
+    # Mettre à jour l'état de la conversation
+    cs.update_conversation_state(conversation_id, EtatConversation.CLOTUREE)
+
+    return {
+        "message": f"Conversation '{conversation_id}' clôturée.",
+        "handoff": handoff.model_dump(),
+    }

@@ -1,7 +1,8 @@
 # services/azure_ai_search_service.py — AzureAISearchService
-# Responsable de la recherche vectorielle dans Azure AI Search (pipeline RAG)
+# Responsable de la recherche hybride (vectorielle + keyword) dans Azure AI Search
 # Appelé par le BotEngine EN PREMIER, avant Azure OpenAI
 
+import logging
 from openai import AzureOpenAI
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
@@ -10,6 +11,9 @@ from azure.core.credentials import AzureKeyCredential
 from app.config import get_settings
 
 settings = get_settings()
+
+# Logger dédié au service de recherche — activé en DEBUG pour diagnostiquer le RAG
+logger = logging.getLogger("smartovate.search")
 
 
 class AzureAISearchService:
@@ -20,22 +24,29 @@ class AzureAISearchService:
       BotEngine
         → AzureAISearchService.search(query)   ← CE FICHIER
             → génère l'embedding de la requête (text-embedding-3-large)
-            → recherche vectorielle dans smartovate-index
-            → retourne les chunks pertinents
+            → recherche HYBRIDE : keyword BM25 + vectorielle HNSW
+            → retourne les chunks les plus pertinents (score RRF)
         → AzureOpenAIService.generate_response(message + chunks)
 
-    Configuration lue depuis .env (jamais hardcodée) :
+    Pourquoi la recherche hybride ?
+    - La recherche vectorielle pure est bonne pour les reformulations sémantiques,
+      mais son score cosinus brut est souvent compris entre 0.5 et 0.7 pour des
+      passages proches mais non identiques. Le seuil de 0.7 les élimine.
+    - La recherche hybride (BM25 + vecteur) utilise le Reciprocal Rank Fusion (RRF)
+      d'Azure, qui combine les deux signaux et produit un score normalisé plus stable,
+      permettant de retrouver les bonnes reformulations.
+
+    Configuration lue depuis .env :
     - AZURE_SEARCH_ENDPOINT
     - AZURE_SEARCH_API_KEY
     - AZURE_SEARCH_INDEX_NAME
-    - AZURE_OPENAI_ENDPOINT             (pour générer l'embedding de la requête)
+    - AZURE_OPENAI_ENDPOINT
     - AZURE_OPENAI_API_KEY
     - AZURE_OPENAI_EMBEDDING_DEPLOYMENT (text-embedding-3-large)
     """
 
     def __init__(self):
         # ── Client Azure AI Search ──────────────────────────────────────
-        # Utilise AzureKeyCredential — la clé vient du .env via config.py
         self.search_client = SearchClient(
             endpoint=settings.azure_search_endpoint,
             index_name=settings.azure_search_index_name,
@@ -43,7 +54,7 @@ class AzureAISearchService:
         )
 
         # ── Client Azure OpenAI pour les embeddings ─────────────────────
-        # On réutilise la même ressource OpenAI que pour gpt-4o
+        # Même modèle que l'ingestion : text-embedding-3-large
         self.openai_client = AzureOpenAI(
             azure_endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
@@ -53,57 +64,85 @@ class AzureAISearchService:
 
     def search(self, query: str, top_k: int = 5) -> list:
         """
-        Recherche les documents les plus pertinents pour une requête donnée.
+        Recherche hybride (keyword BM25 + vectorielle HNSW) pour une requête donnée.
 
-        Étapes internes :
-        1. Générer l'embedding vectoriel de la requête (text-embedding-3-large)
-        2. Lancer une recherche vectorielle sur smartovate-index (HNSW)
-        3. Retourner les top_k chunks les plus proches sémantiquement
+        Étapes :
+        1. Générer l'embedding de la requête (même modèle que l'ingestion)
+        2. Lancer une recherche hybride : BM25 sur le champ 'contenu' + HNSW sur 'embedding'
+        3. Azure AI Search combine les deux via Reciprocal Rank Fusion (RRF)
+        4. Retourner les top_k résultats avec leur score RRF
+
+        Pourquoi hybride plutôt que vectorielle pure :
+        - Vectorielle pure : capte la similarité sémantique mais score souvent < 0.7
+          pour des reformulations ("signer contrat" ≈ "activer compte")
+        - BM25 keyword : capte les correspondances lexicales exactes
+        - Hybride RRF : combine les deux, score plus stable entre 0.01 et 1.0
 
         Args:
             query : question ou message de l'utilisateur
-            top_k : nombre maximum de documents à retourner (défaut: 5)
+            top_k : nombre maximum de résultats (défaut: 5)
 
         Returns:
-            Liste de dicts, chacun contenant :
-            - 'contenu'   : texte du chunk
-            - 'source'    : nom du fichier PDF d'origine
-            - 'categorie' : catégorie du document (ex: services_cloud)
-            - 'page'      : numéro de page dans le PDF
-            - 'score'     : score de pertinence vectorielle
+            Liste de dicts : contenu, source, categorie, page, score
         """
-        # ── Étape 1 : Générer l'embedding de la requête ─────────────────
+        logger.debug("─" * 60)
+        logger.debug(f"[SEARCH] Requête : '{query}'")
+        logger.debug(f"[SEARCH] Modèle embedding : {self.embedding_deployment}")
+        logger.debug(f"[SEARCH] top_k : {top_k}")
+
+        # ── Étape 1 : Embedding de la requête ───────────────────────────
+        # CRITIQUE : utiliser le MÊME modèle que lors de l'ingestion
+        # (text-embedding-3-large via AZURE_OPENAI_EMBEDDING_DEPLOYMENT)
         embedding_response = self.openai_client.embeddings.create(
             input=[query],
-            model=self.embedding_deployment,  # text-embedding-3-large depuis .env
+            model=self.embedding_deployment,
         )
         query_vector = embedding_response.data[0].embedding
+        logger.debug(f"[SEARCH] Embedding généré ({len(query_vector)} dimensions)")
 
-        # ── Étape 2 : Recherche vectorielle dans Azure AI Search ─────────
+        # ── Étape 2 : Recherche hybride ──────────────────────────────────
+        # search_text = requête BM25 keyword sur le champ 'contenu' (analyseur fr.microsoft)
+        # vector_queries = recherche vectorielle HNSW sur le champ 'embedding'
+        # Azure AI Search combine automatiquement via RRF quand les deux sont fournis.
         vector_query = VectorizedQuery(
             vector=query_vector,
             k_nearest_neighbors=top_k,
-            fields="embedding",       # Champ vectoriel défini lors de l'ingestion
+            fields="embedding",
         )
 
         results = self.search_client.search(
-            search_text=None,         # Recherche purement vectorielle (pas full-text)
+            search_text=query,          # BM25 keyword — NOUVEAU (était None avant)
             vector_queries=[vector_query],
             select=["id", "contenu", "source", "categorie", "page"],
             top=top_k,
         )
 
-        # ── Étape 3 : Formater et retourner les résultats ────────────────
+        # ── Étape 3 : Formater et logger les résultats ───────────────────
         documents = []
-        for result in results:
-            documents.append({
+        for i, result in enumerate(results):
+            score = result.get("@search.score", 0.0)
+            doc = {
                 "contenu":   result.get("contenu", ""),
                 "source":    result.get("source", ""),
                 "categorie": result.get("categorie", ""),
                 "page":      result.get("page", 0),
-                "score":     result.get("@search.score", 0.0),
-            })
+                "score":     score,
+            }
+            documents.append(doc)
 
+            # Logs de diagnostic — visibles si le niveau DEBUG est activé
+            logger.debug(f"[SEARCH] Résultat #{i+1}")
+            logger.debug(f"  Source    : {doc['source']}")
+            logger.debug(f"  Page      : {doc['page']}")
+            logger.debug(f"  Score RRF : {score:.4f}")
+            logger.debug(f"  Extrait   : {doc['contenu'][:120]}…")
+
+        if documents:
+            logger.debug(f"[SEARCH] Meilleur score : {documents[0]['score']:.4f}")
+        else:
+            logger.debug("[SEARCH] Aucun résultat retourné par Azure AI Search")
+
+        logger.debug("─" * 60)
         return documents
 
     def index_document(self, document: dict) -> bool:

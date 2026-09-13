@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smartovate — Assistant Virtuel</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="chat-wrapper">
+
+    <!-- ── Header ──────────────────────────────────────────── -->
+    <header class="chat-header">
+      <div class="chat-header__logo" aria-hidden="true">☁️</div>
+      <div class="chat-header__info">
+        <div class="chat-header__title">Smartovate Assistant</div>
+        <div class="chat-header__subtitle">Spécialiste Cloud Microsoft Azure</div>
+      </div>
+      <div class="chat-header__status" aria-live="polite" aria-atomic="true">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">En ligne</span>
+      </div>
+    </header>
+
+    <!-- ── Bandeau handoff ─────────────────────────────────── -->
+    <div
+      class="handoff-banner"
+      id="handoff-banner"
+      role="alert"
+      aria-live="polite"
+    >
+      <span class="handoff-banner__icon" aria-hidden="true">🙋</span>
+      <span id="handoff-banner-text">Un conseiller va prendre en charge votre conversation.</span>
+    </div>
+
+    <!-- ── Zone de messages ───────────────────────────────── -->
+    <main
+      class="chat-messages"
+      id="chat-messages"
+      role="log"
+      aria-live="polite"
+      aria-label="Historique de la conversation"
+    >
+      <div class="loading-message" id="loading-message" aria-busy="true">
+        Connexion à l'assistant…
+      </div>
+    </main>
+
+    <!-- ── Indicateur de frappe ───────────────────────────── -->
+    <div
+      class="typing-indicator"
+      id="typing-indicator"
+      role="status"
+      aria-label="L'assistant est en train d'écrire"
+    >
+      <span class="typing-dot"></span>
+      <span class="typing-dot"></span>
+      <span class="typing-dot"></span>
+    </div>
+
+    <!-- ── Zone de saisie ─────────────────────────────────── -->
+    <footer class="chat-input-area">
+      <div class="chat-actions">
+        <button
+          id="handoff-btn"
+          type="button"
+          aria-label="Demander à parler à un conseiller humain"
+        >
+          🙋 Parler à un conseiller
+        </button>
+      </div>
+      <div class="chat-input-row">
+        <textarea
+          id="message-input"
+          placeholder="Posez votre question…"
+          rows="1"
+          aria-label="Votre message"
+          aria-multiline="true"
+          autocomplete="off"
+          spellcheck="true"
+        ></textarea>
+        <button
+          id="send-btn"
+          type="button"
+          aria-label="Envoyer le message"
+          disabled
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+          </svg>
+        </button>
+      </div>
+    </footer>
+
+  </div>
+
+  <script>
+    /**
+     * Smartovate Web Chat — frontend vanilla JS
+     * Communique avec le backend FastAPI en mode REST API direct
+     * (pas de Direct Line en développement local)
+     */
+
+    // ─────────────────────────────────────────────────────────
+    // Configuration
+    // ─────────────────────────────────────────────────────────
+    const API_BASE = '';                   // même origine — backend sert le frontend
+    const CONVERSATION_ID = generateId(); // ID de session unique par onglet
+
+    // ─────────────────────────────────────────────────────────
+    // État de l'application
+    // ─────────────────────────────────────────────────────────
+    let history = [];          // Historique [{ role, content }]
+    let handoffActive = false; // True si un handoff a été déclenché
+    let pollingInterval = null;// Intervalle de polling des messages agent
+
+    // ─────────────────────────────────────────────────────────
+    // Références DOM
+    // ─────────────────────────────────────────────────────────
+    const $messages   = document.getElementById('chat-messages');
+    const $input      = document.getElementById('message-input');
+    const $sendBtn    = document.getElementById('send-btn');
+    const $handoffBtn = document.getElementById('handoff-btn');
+    const $typingInd  = document.getElementById('typing-indicator');
+    const $loading    = document.getElementById('loading-message');
+    const $banner     = document.getElementById('handoff-banner');
+    const $bannerText = document.getElementById('handoff-banner-text');
+    const $statusDot  = document.getElementById('status-dot');
+    const $statusText = document.getElementById('status-text');
+
+    // ─────────────────────────────────────────────────────────
+    // Utilitaires
+    // ─────────────────────────────────────────────────────────
+    function generateId() {
+      return 'conv-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9);
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    /** Convertit le markdown basique (gras, listes, sauts de ligne) en HTML. */
+    function renderMarkdown(text) {
+      return escapeHtml(text)
+        // **gras**
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        // • puces Unicode → liste
+        .replace(/^[•·]\s+(.+)$/gm, '<li>$1</li>')
+        // sauts de ligne
+        .replace(/\n/g, '<br>');
+    }
+
+    function scrollToBottom() {
+      $messages.scrollTop = $messages.scrollHeight;
+    }
+
+    function setStatus(type) {
+      const map = {
+        online:  { dot: '',         text: 'En ligne' },
+        waiting: { dot: 'waiting',  text: 'En attente d\'agent' },
+        offline: { dot: 'offline',  text: 'Hors ligne' },
+      };
+      const s = map[type] || map.online;
+      $statusDot.className = 'status-dot' + (s.dot ? ' ' + s.dot : '');
+      $statusText.textContent = s.text;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Affichage des messages
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * Ajoute une bulle de message dans la zone de chat.
+     * @param {'user'|'bot'|'agent'} sender
+     * @param {string} text
+     * @param {Array}  sources  — documents RAG (optionnel)
+     */
+    function appendMessage(sender, text, sources = []) {
+      const wrapper = document.createElement('div');
+      wrapper.className = `message message--${sender}`;
+      wrapper.setAttribute('role', sender === 'user' ? 'none' : 'article');
+
+      const bubble = document.createElement('div');
+      bubble.className = 'message__bubble';
+      bubble.innerHTML = renderMarkdown(text);
+      wrapper.appendChild(bubble);
+
+      // Horodatage
+      const meta = document.createElement('div');
+      meta.className = 'message__meta';
+      const senderLabel = sender === 'user' ? 'Vous' : sender === 'agent' ? 'Conseiller' : 'Assistant';
+      meta.textContent = `${senderLabel} · ${new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`;
+      wrapper.appendChild(meta);
+
+      // Sources RAG (masquées par défaut)
+      if (sources && sources.length > 0) {
+        const srcDiv = document.createElement('div');
+        srcDiv.className = 'message__sources';
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = `📚 ${sources.length} source(s)`;
+        details.appendChild(summary);
+        const ul = document.createElement('ul');
+        sources.forEach(s => {
+          const li = document.createElement('li');
+          li.textContent = `${s.source || 'Document'}${s.page ? ' — p.' + s.page : ''}`;
+          ul.appendChild(li);
+        });
+        details.appendChild(ul);
+        srcDiv.appendChild(details);
+        wrapper.appendChild(srcDiv);
+      }
+
+      $messages.appendChild(wrapper);
+      scrollToBottom();
+      return wrapper;
+    }
+
+    function showTyping() {
+      $typingInd.classList.add('visible');
+      scrollToBottom();
+    }
+
+    function hideTyping() {
+      $typingInd.classList.remove('visible');
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Gestion de l'état handoff
+    // ─────────────────────────────────────────────────────────
+
+    function activerHandoff(message) {
+      handoffActive = true;
+      $input.disabled = false;   // Le client peut encore écrire (l'agent verra)
+      $handoffBtn.disabled = true;
+      $banner.classList.add('visible');
+      $bannerText.textContent = 'Un conseiller va prendre en charge votre conversation.';
+      setStatus('waiting');
+      startAgentPolling();
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Polling messages agent
+    // ─────────────────────────────────────────────────────────
+
+    let lastAgentMsgCount = 0;
+
+    function startAgentPolling() {
+      if (pollingInterval) return;
+      pollingInterval = setInterval(async () => {
+        try {
+          const res = await fetch(`${API_BASE}/api/agent/messages/${CONVERSATION_ID}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          if (data.count > lastAgentMsgCount) {
+            for (let i = lastAgentMsgCount; i < data.messages.length; i++) {
+              appendMessage('agent', data.messages[i].contenu);
+            }
+            lastAgentMsgCount = data.count;
+          }
+        } catch (_) {
+          // Silencieux — pas de connexion réseau
+        }
+      }, 3000);
+    }
+
+    function stopAgentPolling() {
+      if (pollingInterval) {
+        clearInterval(pollingInterval);
+        pollingInterval = null;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Appels API
+    // ─────────────────────────────────────────────────────────
+
+    /** Charge le message de bienvenue au démarrage. */
+    async function loadWelcome() {
+      try {
+        const res = await fetch(`${API_BASE}/api/chat/start`);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        $loading.remove();
+        appendMessage('bot', data.message);
+        setStatus('online');
+        enableInput();
+      } catch (err) {
+        $loading.textContent = '⚠️ Impossible de joindre le serveur. Vérifiez que le backend est lancé.';
+        $loading.style.color = '#EF4444';
+        setStatus('offline');
+      }
+    }
+
+    /** Envoie un message et affiche la réponse. */
+    async function sendMessage(text) {
+      if (!text.trim()) return;
+
+      appendMessage('user', text);
+
+      // Snapshot de l'historique AVANT d'y ajouter le message courant.
+      // Le backend reçoit l'historique passé + le message courant séparément.
+      const historySnapshot = history.slice(-10);
+
+      history.push({ role: 'user', content: text });
+
+      disableInput();
+      showTyping();
+
+      try {
+        const res = await fetch(`${API_BASE}/api/chat/message`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            conversation_id: CONVERSATION_ID,
+            message: text,
+            history: historySnapshot, // historique sans le message courant
+            utilisateur_id: 'anonymous',
+          }),
+        });
+
+        hideTyping();
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: 'Erreur inconnue' }));
+          appendMessage('bot', `⚠️ Erreur : ${err.detail || 'Réponse invalide du serveur.'}`);
+          enableInput();
+          return;
+        }
+
+        const data = await res.json();
+        appendMessage('bot', data.reponse, data.sources);
+        history.push({ role: 'assistant', content: data.reponse });
+
+        // Déclencher le mode handoff si nécessaire
+        if (data.handoff && !handoffActive) {
+          activerHandoff(data.reponse);
+        }
+
+      } catch (err) {
+        hideTyping();
+        appendMessage('bot', '⚠️ Impossible de contacter le serveur. Vérifiez votre connexion.');
+      }
+
+      enableInput();
+    }
+
+    /** Déclenche un handoff explicite via le bouton. */
+    async function demanderHandoff() {
+      $handoffBtn.disabled = true;
+      showTyping();
+
+      try {
+        const res = await fetch(`${API_BASE}/api/chat/handoff`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            conversation_id: CONVERSATION_ID,
+            utilisateur_id: 'anonymous',
+            raison: 'Demande explicite via bouton',
+          }),
+        });
+
+        hideTyping();
+
+        if (!res.ok) {
+          appendMessage('bot', '⚠️ Impossible de créer la demande de mise en relation.');
+          $handoffBtn.disabled = false;
+          return;
+        }
+
+        const data = await res.json();
+        appendMessage('bot', data.message);
+        history.push({ role: 'assistant', content: data.message });
+        activerHandoff();
+
+      } catch (err) {
+        hideTyping();
+        appendMessage('bot', '⚠️ Erreur lors de la demande de mise en relation.');
+        $handoffBtn.disabled = false;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Gestion de l'input
+    // ─────────────────────────────────────────────────────────
+
+    function enableInput() {
+      $input.disabled = false;
+      $sendBtn.disabled = $input.value.trim().length === 0;
+      $input.focus();
+    }
+
+    function disableInput() {
+      $input.disabled = true;
+      $sendBtn.disabled = true;
+    }
+
+    // Auto-resize du textarea
+    $input.addEventListener('input', () => {
+      $input.style.height = 'auto';
+      $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
+      $sendBtn.disabled = $input.value.trim().length === 0;
+    });
+
+    // Envoi sur Enter (Shift+Enter = nouvelle ligne)
+    $input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const text = $input.value.trim();
+        if (text && !$sendBtn.disabled) {
+          $input.value = '';
+          $input.style.height = 'auto';
+          $sendBtn.disabled = true;
+          sendMessage(text);
+        }
+      }
+    });
+
+    $sendBtn.addEventListener('click', () => {
+      const text = $input.value.trim();
+      if (text) {
+        $input.value = '';
+        $input.style.height = 'auto';
+        $sendBtn.disabled = true;
+        sendMessage(text);
+      }
+    });
+
+    $handoffBtn.addEventListener('click', demanderHandoff);
+
+    // ─────────────────────────────────────────────────────────
+    // Initialisation
+    // ─────────────────────────────────────────────────────────
+    disableInput();
+    loadWelcome();
+  </script>
+</body>
+</html>
